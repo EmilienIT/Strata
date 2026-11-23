@@ -10,6 +10,7 @@
 #include "ink_dspark.cuh"
 #include "ink_runner.cuh"
 #include "ink_spec.cuh"
+#include "ink_cuda_vision.cuh"
 #include "strata/core/volta_forever.hpp"
 
 #include <algorithm>
@@ -111,6 +112,7 @@ public:
         }
         // Resolve primary + optional multi-GPU list (up to 4 GPUs!) from opts.gpu_ids / opts.gpu_index / opts.gpus
         gpu_id_ = (opts.gpu_index >= 0 && opts.gpu_index < n_dev) ? opts.gpu_index : 0;
+        vision_path_ = opts.vision_path;
         std::vector<int> all_gpus;
         if (!opts.gpu_ids.empty()) {
             for (int g : opts.gpu_ids) {
@@ -822,6 +824,23 @@ public:
         return n_emit;
     }
 
+    // Pictures on the GPU (ink_cuda_vision.cuh); false (and the CPU reference) if the shard or VRAM is missing.
+    bool encode_image(const ImageRec& img, std::vector<float>& out_embeds, std::string& err) override {
+        if (vision_path_.empty() || vit_failed_) return false;
+        std::string verr;
+        if (!vit_.loaded() && !vit_.load(vision_path_, gpu_id_, verr)) {
+            vit_failed_ = true;
+            fprintf(stderr, "[inkling2-vision] GPU encoder unavailable, using the CPU one: %s\n", verr.c_str());
+            return false;
+        }
+        if (!vit_.encode(img, out_embeds, verr)) {
+            fprintf(stderr, "[inkling2-vision] GPU encode failed, using the CPU one: %s\n", verr.c_str());
+            (void)err;
+            return false;
+        }
+        return true;
+    }
+
     bool selfcheck(std::string& err) override {
         cudaDeviceProp prop{};
         cudaError_t ce = cudaGetDeviceProperties(&prop, gpu_id_);
@@ -856,6 +875,8 @@ private:
     }
 
     void cleanup() {
+        vit_.release();
+        vit_failed_ = false;
         if (dspark_) { dspark_->free_all(); dspark_.reset(); }
         if (runner_) { runner_->free_all(); runner_.reset(); }
         if (d_sconv_snap_) { cudaFree(d_sconv_snap_); d_sconv_snap_ = nullptr; }
@@ -887,6 +908,9 @@ private:
     KvDtype kv_dtype_ = KvDtype::FP16;
     std::string dev_info_;
 
+    std::string vision_path_;
+    cuvit::CudaVit vit_;
+    bool vit_failed_ = false;
     strata::ink::InkCudaModel model_;
     std::unique_ptr<strata::ink::InkCudaRunner> runner_;
     std::unique_ptr<strata::ink::InkDSpark> dspark_;
